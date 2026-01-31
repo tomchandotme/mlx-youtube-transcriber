@@ -32,8 +32,9 @@ class TranscriberApp(ctk.CTk):
 
         # 1. Header
         self.header_label = ctk.CTkLabel(
-            self, text="MLX YouTube Transcriber",
-            font=ctk.CTkFont(size=24, weight="bold")
+            self,
+            text="MLX YouTube Transcriber",
+            font=ctk.CTkFont(size=24, weight="bold"),
         )
         self.header_label.grid(row=0, column=0, padx=30, pady=(30, 10), sticky="w")
 
@@ -43,21 +44,25 @@ class TranscriberApp(ctk.CTk):
         self.input_frame.grid_columnconfigure(0, weight=1)
 
         self.url_label = ctk.CTkLabel(
-            self.input_frame, text="YouTube URL",
-            font=ctk.CTkFont(size=14, weight="bold")
+            self.input_frame,
+            text="YouTube URL",
+            font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.url_label.grid(row=0, column=0, padx=20, pady=(15, 5), sticky="w")
 
         self.url_entry = ctk.CTkEntry(
-            self.input_frame, placeholder_text="https://www.youtube.com/watch?v=...",
-            height=40
+            self.input_frame,
+            placeholder_text="https://www.youtube.com/watch?v=...",
+            height=40,
         )
         self.url_entry.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="ew")
 
         self.start_button = ctk.CTkButton(
-            self.input_frame, text="Start Transcription",
+            self.input_frame,
+            text="Start Transcription",
             font=ctk.CTkFont(weight="bold"),
-            command=self.start_click, height=40
+            command=self.start_click,
+            height=40,
         )
         self.start_button.grid(row=1, column=1, padx=(0, 20), pady=(0, 20))
 
@@ -67,8 +72,7 @@ class TranscriberApp(ctk.CTk):
         self.progress_frame.grid_columnconfigure(0, weight=1)
 
         self.status_label = ctk.CTkLabel(
-            self.progress_frame, text="Status: Ready",
-            font=ctk.CTkFont(slant="italic")
+            self.progress_frame, text="Status: Ready", font=ctk.CTkFont(slant="italic")
         )
         self.status_label.grid(row=0, column=0, padx=5, pady=0, sticky="w")
 
@@ -84,32 +88,41 @@ class TranscriberApp(ctk.CTk):
         self.result_frame.grid_rowconfigure(1, weight=1)
 
         self.result_label = ctk.CTkLabel(
-            self.result_frame, text="Transcription Result",
-            font=ctk.CTkFont(size=14, weight="bold")
+            self.result_frame,
+            text="Transcription Result",
+            font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.result_label.grid(row=0, column=0, padx=20, pady=10, sticky="w")
 
         self.copy_button = ctk.CTkButton(
-            self.result_frame, text="Copy Text", width=100,
-            command=self.copy_click
+            self.result_frame, text="Copy Text", width=100, command=self.copy_click
         )
         self.copy_button.grid(row=0, column=1, padx=20, pady=10, sticky="e")
 
         self.result_textbox = ctk.CTkTextbox(
-            self.result_frame, font=ctk.CTkFont(size=13),
-            border_width=1
+            self.result_frame, font=ctk.CTkFont(size=13), border_width=1
         )
         self.result_textbox.grid(
             row=1, column=0, columnspan=2, padx=20, pady=(0, 20), sticky="nsew"
         )
 
     def update_status(self, msg: str, loading: bool = False):
-        self.status_label.configure(text=f"Status: {msg}")
-        if loading:
-            self.progress_bar.start()
-        else:
-            self.progress_bar.stop()
-            self.progress_bar.set(0)
+        def _update():
+            self.status_label.configure(text=f"Status: {msg}")
+            if loading:
+                self.progress_bar.start()
+            else:
+                self.progress_bar.stop()
+                self.progress_bar.set(0)
+
+        self.after(0, _update)
+
+    def set_result(self, text: str):
+        def _set():
+            self.result_textbox.delete("1.0", tk.END)
+            self.result_textbox.insert("1.0", text)
+
+        self.after(0, _set)
 
     def copy_click(self):
         text = self.result_textbox.get("1.0", tk.END).strip()
@@ -140,15 +153,21 @@ class TranscriberApp(ctk.CTk):
                 result = mlx_whisper.transcribe(
                     str(audio_path),
                     path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
+                    task="transcribe",
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    word_timestamps=False,
+                    no_speech_threshold=0.5,
                 )
 
-                self.result_textbox.delete("1.0", tk.END)
-                self.result_textbox.insert("1.0", result["text"])
+                result_text = "\n".join([s["text"].strip() for s in result["segments"]])
+
+                self.set_result(result_text)
                 self.update_status("Finished!", False)
         except Exception as e:
             self.update_status(f"Error: {str(e)}", False)
         finally:
-            self.start_button.configure(state="normal")
+            self.after(0, lambda: self.start_button.configure(state="normal"))
 
     def start_click(self):
         url = self.url_entry.get()
