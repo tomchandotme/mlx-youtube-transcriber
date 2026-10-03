@@ -15,6 +15,115 @@ import threading
 from pathlib import Path
 import tkinter as tk
 
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+AUDIO_FORMAT = "bestaudio/best"
+AUDIO_CODEC = "wav"
+
+RETRIES = 10
+FRAGMENT_RETRIES = 10
+EXTRACTOR_RETRIES = 5
+SOCKET_TIMEOUT = 30
+
+# yt-dlp needs a JS runtime plus this solver script to answer YouTube's "n"
+# challenge. Fetching it can fail offline, but yt-dlp only warns and carries
+# on, so it never turns into a hard failure.
+REMOTE_COMPONENTS = ("ejs:github",)
+
+# YouTube keeps pushing clients onto SABR streaming, which returns formats
+# whose URLs cannot be fetched — surfacing as "HTTP Error 403: Forbidden".
+# android_vr is in yt-dlp's default client set and is the one that most often
+# breaks, so it is excluded from the first attempt; the later strategies fall
+# back to older clients that still hand back plain CDN URLs.
+# See https://github.com/yt-dlp/yt-dlp/issues/12482 and /issues/17456
+DOWNLOAD_STRATEGIES = (
+    ("default", ("default", "-android_vr")),
+    ("tv_embedded", ("tv_embedded",)),
+    ("android", ("android",)),
+)
+
+FORBIDDEN_HINTS = ("403", "forbidden")
+
+
+class AudioDownloadError(RuntimeError):
+    """Raised when every player-client strategy failed to fetch the audio."""
+
+    def __init__(self, hint: str, details: str):
+        super().__init__(hint)
+        self.hint = hint
+        self.details = details
+
+
+def build_ydl_opts(tmp_dir: Path, clients) -> dict:
+    """Build a fresh yt-dlp options mapping for a single download attempt."""
+    return {
+        "format": AUDIO_FORMAT,
+        "outtmpl": str(tmp_dir / "%(title)s.%(ext)s"),
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": AUDIO_CODEC}],
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "retries": RETRIES,
+        "fragment_retries": FRAGMENT_RETRIES,
+        "extractor_retries": EXTRACTOR_RETRIES,
+        "socket_timeout": SOCKET_TIMEOUT,
+        "remote_components": list(REMOTE_COMPONENTS),
+        "extractor_args": {"youtube": {"player_client": list(clients)}},
+    }
+
+
+def describe_failure(errors) -> AudioDownloadError:
+    """Turn per-strategy errors into an actionable, user-facing error."""
+    details = "\n".join(errors)
+    if any(hint in details.lower() for hint in FORBIDDEN_HINTS):
+        hint = (
+            "YouTube refused the audio download (HTTP 403). Update yt-dlp with "
+            "'uv run --refresh-package yt-dlp gui.py' and try again; if it "
+            "persists, sign in to YouTube in your browser first."
+        )
+    else:
+        hint = "Could not download audio from YouTube. See the result box for details."
+    return AudioDownloadError(hint, f"Download attempts:\n{details}")
+
+
+def download_audio(url: str, tmp_dir: Path, on_attempt) -> Path:
+    """Download `url` as WAV, trying each player-client strategy in turn."""
+    errors = []
+    for index, (label, clients) in enumerate(DOWNLOAD_STRATEGIES):
+        on_attempt(label, index)
+        try:
+            with yt_dlp.YoutubeDL(build_ydl_opts(tmp_dir, clients)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                expected = Path(ydl.prepare_filename(info)).with_suffix(f".{AUDIO_CODEC}")
+            if expected.is_file():
+                return expected
+            produced = sorted(tmp_dir.glob(f"*.{AUDIO_CODEC}"))
+            if produced:
+                return produced[0]
+            errors.append(f"[{label}] finished without producing an audio file")
+        except Exception as exc:
+            errors.append(f"[{label}] {exc}")
+
+    raise describe_failure(errors)
+
+
+def transcribe_audio(audio_path: Path) -> str:
+    """Transcribe a WAV file with MLX Whisper and join the segments."""
+    result = mlx_whisper.transcribe(
+        str(audio_path),
+        path_or_hf_repo=WHISPER_MODEL,
+        task="transcribe",
+        temperature=0.0,
+        condition_on_previous_text=False,
+        word_timestamps=True,
+        no_speech_threshold=0.5,
+        language=None,
+        suppress_tokens="",  # Don't suppress anything (empty = no suppression)
+        suppress_blank=False,  # Don't suppress blank outputs either
+    )
+    segments = result.get("segments") or []
+    return "\n".join(segment["text"].strip() for segment in segments)
+
 
 class TranscriberApp(ctk.CTk):
     def __init__(self):
@@ -131,41 +240,25 @@ class TranscriberApp(ctk.CTk):
             self.clipboard_append(text)
             self.update_status("Copied to clipboard!")
 
+    def on_download_attempt(self, label: str, index: int):
+        """Surface which player client is being tried, on retries."""
+        if index > 0:
+            self.update_status(f"Retrying download (client: {label})...", True)
+
     def process_video(self, url):
         try:
             self.update_status("Downloading audio...", True)
             with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_path = Path(tmp_dir)
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": str(tmp_path / "%(title)s.%(ext)s"),
-                    "postprocessors": [
-                        {"key": "FFmpegExtractAudio", "preferredcodec": "wav"}
-                    ],
-                    "quiet": True,
-                }
-
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    audio_path = Path(ydl.prepare_filename(info)).with_suffix(".wav")
+                audio_path = download_audio(url, Path(tmp_dir), self.on_download_attempt)
 
                 self.update_status("Transcribing (using MLX)...", True)
-                result = mlx_whisper.transcribe(
-                    str(audio_path),
-                    path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
-                    task="transcribe",
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                    word_timestamps=False,
-                    no_speech_threshold=0.5,
-                )
-
-                result_text = "\n".join([s["text"].strip() for s in result["segments"]])
-
-                self.set_result(result_text)
+                self.set_result(transcribe_audio(audio_path))
                 self.update_status("Finished!", False)
-        except Exception as e:
-            self.update_status(f"Error: {str(e)}", False)
+        except AudioDownloadError as exc:
+            self.set_result(exc.details)
+            self.update_status(f"Error: {exc.hint}", False)
+        except Exception as exc:
+            self.update_status(f"Error: {exc}", False)
         finally:
             self.after(0, lambda: self.start_button.configure(state="normal"))
 
